@@ -1,5 +1,10 @@
 #!/usr/bin/python
 
+"""
+iptables -t nat -A PREROUTING -s 192.168.0.0/16 -p tcp --dport 443 \
+  -j REDIRECT --to-ports 4443
+"""
+
 import tempfile
 import sys
 import os
@@ -20,7 +25,7 @@ logging.basicConfig(level=logging.DEBUG)
 
 @defer.inlineCallbacks
 def certMaker(cert):
-    print('certMaker(%s)' % cert)
+    # log.msg('certMaker(%s)' % cert)
 
     if cert['subject'][-1][0][0] != 'commonName':
         raise Exception('tip of subject is not commonName')
@@ -37,9 +42,9 @@ def certMaker(cert):
         # with the same sha1 hash of binary blob
         os.stat(certfile)
     except:
-        print("making new fake cert")
+        log.msg("making new fake cert")
     else:
-        print("using fake cert from disk")
+        log.msg("using fake cert from disk")
         # file already exists on-disk
         # assume key is present too
         r = {
@@ -81,7 +86,7 @@ def certMaker(cert):
         raise Exception('error generating csr', err)
 
     fd, tmpname = tempfile.mkstemp()
-    print('tmpname: ' % tmpname)
+    log.msg('tmpname:', tmpname)
     try:
         ext = os.fdopen(fd, 'w')
 
@@ -93,7 +98,8 @@ def certMaker(cert):
                     continue
                 dns.append('DNS:'+san[1])
         if dns:
-            print(ext, "subjectAltName=" + ','.join(dns))
+            # log.msg(ext, "subjectAltName=" + ','.join(dns))
+            pass
 
         # FIXME: copy other extensions? eku?
         ext.close()
@@ -147,6 +153,7 @@ def _ssl_cert_chain(host, port):
     # FIXME: configurable timeout?
     s.settimeout(5)
     s.connect((host, port))
+    logging.info('try connect in', host, port)
 
     sec = pyssl.wrap_socket(
             s,
@@ -158,8 +165,10 @@ def _ssl_cert_chain(host, port):
             # It might be possible to do better with an explicit
             # context & verify callback?
             cert_reqs=pyssl.CERT_REQUIRED,
-            # ca_certs='/etc/pki/tls/certs/ca-bundle.trust.crt',
-            ca_certs='cacert.pem'
+            # ssl_version=pyssl.PROTOCOL_TLSv1,
+            # ciphers="ADH-AES256-SHA",
+            ca_certs='/etc/pki/tls/certs/ca-bundle.trust.crt',
+            # ca_certs='cacert.pem'
             )
     # should be redundant, in theory...
     sec.do_handshake()
@@ -257,14 +266,14 @@ class MitmProtocol(Forwarder):
         # get the original IP
         # WARNING: accessing private member of transport
         # also, will fail if the socket isn't actually redirected
-        # orig = self.transport.socket.getsockopt(socket.SOL_IP, socket.SO_ORIGINAL_DST, 16)
-        addr, port = self.transport.socket.getsockname()
+        orig = self.transport.socket.getsockopt(socket.SOL_IP, socket.SO_ORIGINAL_DST, 16)
+        # addr, port = self.transport.socket.getsockname()
         # orig = socket.socket.getsockopt(self.transport.socket, socket.SOL_IP, socket.SO_ORIGINAL_DST, 16)
         # WARNING: not IPv6-safe
-        # fam, port, addr, rest = struct.unpack('!HH4s8s', orig)
-        # addr = socket.inet_ntoa(addr.encode())
+        fam, port, addr, rest = struct.unpack('!HH4s8s', orig)
+        addr = socket.inet_ntoa(addr)
 
-        log.msg("connection to", addr, port, "intercepted")
+        log.msg("connection from", addr, port)
 
         d = cache.checkSSL(addr, port).addCallback(self._gotcert, addr, port)
         d.addErrback(self._goterr, addr, port)
