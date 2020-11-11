@@ -1,10 +1,25 @@
-import os
+#!/usr/bin/python
+
 import tempfile
-from twisted.internet import utils
+import sys
+import os
+import struct
+import hashlib
+import socket
+socket.SO_ORIGINAL_DST = 80
+import ssl as pyssl
+
+from twisted.internet import ssl, reactor, protocol, defer, utils, threads
+from twisted.python import log
+from twisted.protocols import tls
+
+import logging
+
+logging.basicConfig(level=logging.DEBUG)
 
 
+@defer.inlineCallbacks
 def certMaker(cert):
-
     print('certMaker(%s)' % cert)
 
     if cert['subject'][-1][0][0] != 'commonName':
@@ -32,7 +47,7 @@ def certMaker(cert):
                 'cert': certfile,
                 'key': keyfile,
             }
-        return r
+        defer.returnValue(r)
 
 
     # Is this sufficient? Maybe we want to copy whole DN?
@@ -42,7 +57,7 @@ def certMaker(cert):
     # FIXME: key filenames by host/port combo, or maybe "real" cert hash?
     # FIXME: make the CA configurable?
     res = yield utils.getProcessOutputAndValue(
-        '/usr/bin/openssl',
+        'openssl',
         (
             'req',
             '-newkey',
@@ -57,11 +72,16 @@ def certMaker(cert):
         ),
     )
 
-    out, err, code = res
+    (
+        _, # out
+        err,
+        code
+    ) = res
     if code!=0:
         raise Exception('error generating csr', err)
 
     fd, tmpname = tempfile.mkstemp()
+    print('tmpname: ' % tmpname)
     try:
         ext = os.fdopen(fd, 'w')
 
@@ -80,7 +100,7 @@ def certMaker(cert):
 
         # process the .csr with our CA cert to generate a signed cert
         res = yield utils.getProcessOutputAndValue(
-            '/usr/bin/openssl',
+            'openssl',
             (
                 'x509',
                 '-req',
@@ -103,13 +123,192 @@ def certMaker(cert):
         # remove temp file
         os.unlink(tmpname)
 
-    out, err, code = res
+    (
+        _, # out
+        err,
+        code
+    ) = res
     if code==0:
         r = {
                 'name': hostname,
                 'cert': certfile,
                 'key': keyfile,
-                }
-        return r
+            }
+        defer.returnValue(r)
 
     raise Exception('failed to generate cert', err)
+
+
+def _ssl_cert_chain(host, port):
+
+    # FIXME: use getaddrinfo, not IPv6-safe here
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+
+    # FIXME: configurable timeout?
+    s.settimeout(5)
+    s.connect((host, port))
+
+    sec = pyssl.wrap_socket(
+            s,
+            # NOTE: it seems that, unless we do verification,
+            # python doesn't expose the peer cert to us.
+            # This means we need to supply a CA bundle, so
+            # this code doesn't support self-signed certs.
+            #
+            # It might be possible to do better with an explicit
+            # context & verify callback?
+            cert_reqs=pyssl.CERT_REQUIRED,
+            # ca_certs='/etc/pki/tls/certs/ca-bundle.trust.crt',
+            ca_certs='cacert.pem'
+            )
+    # should be redundant, in theory...
+    sec.do_handshake()
+
+    # get peer certs
+    rv = sec.getpeercert()
+    bin = sec.getpeercert(binary_form=True)
+    rv['hash'] = hashlib.sha1(bin).hexdigest()
+
+    sec.close()
+
+    del sec
+    del s
+
+    return rv
+
+
+def ssl_cert_chain(host, port):
+    return threads.deferToThread(_ssl_cert_chain, host, port)
+
+
+class CertCache:
+
+    def __init__(self):
+        self._cache = {}
+
+    @defer.inlineCallbacks
+    def checkSSL(self, host, port):
+
+        if (host, port) in self._cache:
+            defer.returnValue(self._cache[host, port])
+
+        # get the cert on that ip/port combp
+        cert = yield ssl_cert_chain(host, port)
+
+        # make a fake
+        fake = yield certMaker(cert)
+
+        # add to cache
+        self._cache[host, port] = fake
+
+        # done
+        defer.returnValue(fake)
+
+
+cache = CertCache()
+
+
+class Forwarder(protocol.Protocol):
+    other = None
+
+    def connectionLost(self, reason):
+        if self.other is None:
+            pass
+        else:
+            self.other.transport.loseConnection()
+            self.other = None
+
+    def dataReceived(self, data):
+        self.other.transport.write(data)
+
+
+class ForwardOut(Forwarder):
+    def connectionMade(self):
+        self.other.other = self
+
+        # copied from t.p.portforward
+        self.transport.registerProducer(self.other.transport, True)
+        self.other.transport.registerProducer(self.transport, True)
+
+        # re-start the inbound transport produder & ssl server mode
+        self.other._resume()
+
+
+class ForwardFactory(protocol.ClientFactory):
+    noisy = False
+
+    def buildProtocol(self, addr):
+        prot = ForwardOut()
+        prot.other = self.other
+        return prot
+
+    def clientConnectionFailed(self, reason):
+        self.other.transport.loseConnection()
+
+
+class MitmProtocol(Forwarder):
+
+    certinfo = None
+
+    def connectionMade(self):
+        # stop the transport producing
+        self.transport.pauseProducing()
+
+        # get the original IP
+        # WARNING: accessing private member of transport
+        # also, will fail if the socket isn't actually redirected
+        # orig = self.transport.socket.getsockopt(socket.SOL_IP, socket.SO_ORIGINAL_DST, 16)
+        addr, port = self.transport.socket.getsockname()
+        # orig = socket.socket.getsockopt(self.transport.socket, socket.SOL_IP, socket.SO_ORIGINAL_DST, 16)
+        # WARNING: not IPv6-safe
+        # fam, port, addr, rest = struct.unpack('!HH4s8s', orig)
+        # addr = socket.inet_ntoa(addr.encode())
+
+        log.msg("connection to", addr, port, "intercepted")
+
+        d = cache.checkSSL(addr, port).addCallback(self._gotcert, addr, port)
+        d.addErrback(self._goterr, addr, port)
+
+    def _goterr(self, fail, orighost, origport):
+        log.msg('failed to get SSL cert for', orighost, origport)
+        log.err(fail)
+        self.transport.loseConnection()
+
+    def _gotcert(self, result, orighost, origport):
+        self.certinfo = result
+
+        log.msg("conneccting to", orighost, origport)
+        f = ForwardFactory()
+        f.other = self
+
+        ccf = ssl.ClientContextFactory()
+        reactor.connectSSL(orighost, origport, f, ccf)
+
+    def _resume(self):
+        # ok, outbound SSL connection is alive
+        self.transport.resumeProducing()
+
+        ctx = ssl.DefaultOpenSSLContextFactory(self.certinfo['key'], self.certinfo['cert'])
+        self.transport.startTLS(ctx)
+
+
+class MitmFactory(protocol.ServerFactory):
+    noisy = False
+
+    def logPrefix(self):
+        return '-'
+
+    def buildProtocol(self, addr):
+        return MitmProtocol()
+
+
+def main():
+    log.startLogging(sys.stderr)
+
+    factory = MitmFactory()
+    reactor.listenTCP(4443, factory)
+    reactor.run()
+
+
+if __name__=='__main__':
+    main()
