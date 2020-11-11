@@ -153,7 +153,7 @@ def _ssl_cert_chain(host, port):
     # FIXME: configurable timeout?
     s.settimeout(5)
     s.connect((host, port))
-    logging.info('try connect in', host, port)
+    log.msg('try connect in', host, port)
 
     sec = pyssl.wrap_socket(
             s,
